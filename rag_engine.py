@@ -1,110 +1,123 @@
-import sqlite3
+import re
 import json
-import os
-from config import DATASETS_FOLDER
+from typing import List, Tuple, Optional
 
-class Database:
-    def __init__(self, db_path="bot_data.db"):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self._create_tables()
+class RAGEngine:
+    """Поиск по датасету на основе ключевых слов"""
     
-    def _create_tables(self):
-        """Создаём таблицы"""
-        # Пользователи и их настройки
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                mode TEXT DEFAULT 'private',  -- private / public
-                dataset_file TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+    @staticmethod
+    def extract_keywords(text: str) -> List[str]:
+        """Извлекаем ключевые слова из текста"""
+        text = text.lower()
+        text = re.sub(r'[^\w\s]', ' ', text)
         
-        # Датасеты (сообщения)
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS datasets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                question TEXT,
-                answer TEXT,
-                keywords TEXT,
-                FOREIGN KEY (user_id) REFERENCES users(user_id)
-            )
-        ''')
+        stop_words = {'и', 'в', 'не', 'что', 'он', 'на', 'я', 'с', 'как', 'а', 'то', 
+                     'она', 'но', 'да', 'ты', 'к', 'у', 'же', 'вы', 'за', 'бы', 'по',
+                     'мне', 'было', 'от', 'меня', 'нет', 'о', 'из', 'ему', 'когда',
+                     'даже', 'ну', 'ли', 'уже', 'или', 'быть', 'был', 'до', 'вас',
+                     'сказал', 'там', 'потом', 'себя', 'ей', 'может', 'они', 'тут',
+                     'где', 'есть', 'надо', 'для', 'мы', 'их', 'чем', 'была', 'сам',
+                     'чтоб', 'без', 'будто', 'чего', 'раз', 'тоже', 'себе', 'под',
+                     'жизнь', 'будет', 'тогда', 'кто', 'этот', 'говорил', 'того',
+                     'потому', 'этого', 'какой', 'совсем', 'ним', 'здесь', 'этом',
+                     'один', 'почти', 'мой', 'тем', 'чтобы', 'нее', 'кажется',
+                     'сейчас', 'были', 'куда', 'зачем', 'сказать', 'всех', 'никогда',
+                     'сегодня', 'можно', 'при', 'наконец', 'два', 'об', 'другой',
+                     'хоть', 'после', 'над', 'больше', 'тот', 'через', 'эти', 'нас',
+                     'про', 'всего', 'них', 'какая', 'много', 'разве', 'сказала',
+                     'три', 'эту', 'моя', 'перед', 'иногда', 'лучше', 'чуть', 'том',
+                     'нельзя', 'такой', 'им', 'более', 'всегда', 'конечно', 'всю',
+                     'между'}
         
-        self.conn.commit()
+        words = text.split()
+        keywords = [word for word in words if len(word) > 2 and word not in stop_words]
+        return keywords
     
-    def add_user(self, user_id, username):
-        """Добавляем пользователя"""
-        self.cursor.execute(
-            "INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)",
-            (user_id, username)
-        )
-        self.conn.commit()
+    @staticmethod
+    def parse_dataset_file(file_path: str) -> List[Tuple[str, str, str]]:
+        """
+        Парсим файл с датасетом
+        Поддерживаемые форматы: JSON и TXT
+        """
+        pairs = []
+        
+        try:
+            if file_path.endswith('.json'):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    
+                    if isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict) and 'question' in item and 'answer' in item:
+                                q = str(item['question']).strip()
+                                a = str(item['answer']).strip()
+                                if q and a:
+                                    keywords = ' '.join(RAGEngine.extract_keywords(q))
+                                    pairs.append((q, a, keywords))
+                    elif isinstance(data, dict):
+                        for q, a in data.items():
+                            q = str(q).strip()
+                            a = str(a).strip()
+                            if q and a:
+                                keywords = ' '.join(RAGEngine.extract_keywords(q))
+                                pairs.append((q, a, keywords))
+            
+            elif file_path.endswith('.txt'):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                blocks = re.split(r'\n\s*\n|\n={3,}\n', content.strip())
+                
+                for block in blocks:
+                    lines = [l.strip() for l in block.strip().split('\n') if l.strip()]
+                    if len(lines) >= 2:
+                        question = lines[0]
+                        answer = '\n'.join(lines[1:])
+                        keywords = ' '.join(RAGEngine.extract_keywords(question))
+                        pairs.append((question, answer, keywords))
+        
+        except Exception as e:
+            print(f"Ошибка парсинга файла {file_path}: {e}")
+        
+        return pairs
     
-    def set_mode(self, user_id, mode):
-        """Устанавливаем режим (private/public)"""
-        self.cursor.execute(
-            "UPDATE users SET mode = ? WHERE user_id = ?",
-            (mode, user_id)
-        )
-        self.conn.commit()
+    @staticmethod
+    def find_best_answer(user_message: str, qa_pairs: List[Tuple[str, str, str]]) -> Optional[str]:
+        """
+        Находим лучший ответ на основе совпадения ключевых слов
+        """
+        if not qa_pairs:
+            return None
+        
+        user_keywords = set(RAGEngine.extract_keywords(user_message))
+        if not user_keywords:
+            return None
+        
+        best_score = 0
+        best_answer = None
+        
+        for question, answer, keywords_str in qa_pairs:
+            keywords = set(keywords_str.split())
+            common = user_keywords & keywords
+            score = len(common)
+            
+            if score > best_score:
+                best_score = score
+                best_answer = answer
+        
+        if best_score >= 1:
+            return best_answer
+        
+        return None
     
-    def get_mode(self, user_id):
-        """Получаем режим пользователя"""
-        self.cursor.execute(
-            "SELECT mode FROM users WHERE user_id = ?",
-            (user_id,)
-        )
-        result = self.cursor.fetchone()
-        return result[0] if result else 'private'
-    
-    def set_dataset_file(self, user_id, filename):
-        """Сохраняем имя файла датасета"""
-        self.cursor.execute(
-            "UPDATE users SET dataset_file = ? WHERE user_id = ?",
-            (filename, user_id)
-        )
-        self.conn.commit()
-    
-    def get_dataset_file(self, user_id):
-        """Получаем имя файла датасета"""
-        self.cursor.execute(
-            "SELECT dataset_file FROM users WHERE user_id = ?",
-            (user_id,)
-        )
-        result = self.cursor.fetchone()
-        return result[0] if result else None
-    
-    def clear_dataset(self, user_id):
-        """Очищаем датасет пользователя"""
-        self.cursor.execute(
-            "DELETE FROM datasets WHERE user_id = ?",
-            (user_id,)
-        )
-        self.conn.commit()
-    
-    def add_qa_pair(self, user_id, question, answer, keywords):
-        """Добавляем пару вопрос-ответ"""
-        self.cursor.execute(
-            "INSERT INTO datasets (user_id, question, answer, keywords) VALUES (?, ?, ?, ?)",
-            (user_id, question, answer, keywords)
-        )
-        self.conn.commit()
-    
-    def get_all_qa_pairs(self, user_id):
-        """Получаем все пары пользователя"""
-        self.cursor.execute(
-            "SELECT question, answer, keywords FROM datasets WHERE user_id = ?",
-            (user_id,)
-        )
-        return self.cursor.fetchall()
-    
-    def get_all_users_with_datasets(self):
-        """Получаем всех пользователей с датасетами (для public режима)"""
-        self.cursor.execute(
-            "SELECT DISTINCT user_id FROM datasets"
-        )
-        return [row[0] for row in self.cursor.fetchall()]
+    @staticmethod
+    def get_stats(qa_pairs: List[Tuple[str, str, str]]) -> str:
+        """Статистика датасета"""
+        total = len(qa_pairs)
+        if total == 0:
+            return "Датасет пуст"
+        
+        avg_q_len = sum(len(q) for q, _, _ in qa_pairs) / total
+        avg_a_len = sum(len(a) for _, a, _ in qa_pairs) / total
+        
+        return f"Записей: {total} | Ср. длина вопроса: {avg_q_len:.0f} | Ср. длина ответа: {avg_a_len:.0f}"
