@@ -1,10 +1,6 @@
-
-
-# Токен бота от @BotFather
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8500113818:AAECdcA15J1PBP8uYg4-bOF66RXIrZL161Y")
 
-# Папка для хранения датасетов
 DATASETS_FOLDER = "datasets"
 
-# Создаём папку если не существует
+
 os.makedirs(DATASETS_FOLDER, exist_ok=True)
