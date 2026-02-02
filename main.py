@@ -99,7 +99,10 @@ async def upload_dataset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     document = update.message.document
     
-    if not document.filename.lower().endswith(('.json', '.txt')):
+    # ИСПРАВЛЕНО: filename → file_name
+    file_name = document.file_name.lower() if document.file_name else ""
+    
+    if not file_name.endswith(('.json', '.txt')):
         await update.message.reply_text("❌ Поддерживаются только .json и .txt файлы!")
         return
     
@@ -109,7 +112,11 @@ async def upload_dataset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await context.bot.get_file(document.file_id)
         user_folder = Path(DATASETS_FOLDER) / str(user.id)
         user_folder.mkdir(exist_ok=True)
-        file_path = user_folder / document.filename
+        
+        # ИСПРАВЛЕНО: используем file_name вместо filename
+        safe_filename = "".join(c if c.isalnum() or c in ('.', '_', '-') else '_' for c in file_name)
+        file_path = user_folder / safe_filename
+        
         await file.download_to_drive(str(file_path))
         
         qa_pairs = RAGEngine.parse_dataset_file(str(file_path))
@@ -126,7 +133,7 @@ async def upload_dataset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for question, answer, keywords in qa_pairs:
             db.add_qa_pair(user.id, question, answer, keywords)
         
-        db.set_dataset_file(user.id, document.filename)
+        db.set_dataset_file(user.id, safe_filename)
         
         stats = RAGEngine.get_stats(qa_pairs)
         await update.message.reply_text(
@@ -135,6 +142,7 @@ async def upload_dataset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        logger.error(f"Ошибка загрузки: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -183,7 +191,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📤 ОТПРАВЬ ФАЙЛ\n\n"
             "Отправь .json или .txt файл как документ.\n"
             "Формат:\n"
-            "JSON: [{\"q\": \"...\", \"a\": \"...\"}]\n"
+            "JSON: [{\"question\": \"...\", \"answer\": \"...\"}]\n"
             "TXT: Вопрос\\n\\nОтвет",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")
@@ -208,7 +216,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qa_pairs = db.get_all_qa_pairs(user_id)
         stats = RAGEngine.get_stats(qa_pairs)
         await query.edit_message_text(
-            f"📊 СТАТИСТИКА ДАТАСЕТАА:\n{stats}",
+            f"📊 СТАТИСТИКА ДАТАСЕТА:\n{stats}",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")
             ]])
@@ -243,7 +251,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
     
-    logger.info("✅ Бот запущен!")
+    logger.info("✅ Бот запущен и готов к работе!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
