@@ -1,258 +1,258 @@
-import logging
-import os
-from pathlib import Path
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, 
-    CommandHandler, 
-    MessageHandler, 
-    CallbackQueryHandler,
-    filters, 
-    ContextTypes
-)
-from database import Database
-from rag_engine import RAGEngine
-from config import BOT_TOKEN, DATASETS_FOLDER
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+import os
+import sqlite3
+import logging
+import asyncio
+from typing import List, Tuple, Optional
+
+from telegram import Update, Document
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+
+# Optional ML libs
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    SKLEARN_AVAILABLE = True
+except Exception:
+    SKLEARN_AVAILABLE = False
+
+from rapidfuzz import fuzz, process  # fast fuzzy fallback
+
+# ====== Config ======
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "REPLACE_WITH_YOUR_TOKEN")
+ADMIN_IDS = os.environ.get("ADMIN_IDS", "")  # comma separated user ids who can upload/manage
+ADMIN_IDS = [int(x) for x in ADMIN_IDS.split(",") if x.strip().isdigit()]
+
+DB_PATH = "responses.db"
+UPLOADS_DIR = "uploads"
+SIM_THRESHOLD = 0.45  # косинус/фазовый порог (0..1), подберите по набору данных
+TOP_K = 3  # сколько вариантов показывать
+
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-db = Database()
+# ====== DB helpers ======
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS responses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL
+    )
+    """)
+    conn.commit()
+    conn.close()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.add_user(user.id, user.username)
-    
-    welcome_text = f"""
-👋 Привет, {user.first_name}!
+def add_responses_bulk(lines: List[str]):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.executemany("INSERT INTO responses (text) VALUES (?)", ((l.strip(),) for l in lines if l.strip()))
+    conn.commit()
+    conn.close()
 
-Я бот-ассистент на основе твоего датасета.
+def get_all_responses() -> List[str]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT text FROM responses")
+    rows = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return rows
 
-📚 Как пользоваться:
-1. Отправь мне файл .json или .txt с вопросами и ответами
-2. Я проиндексирую его
-3. Задавай вопросы — я буду отвечать из твоего датасета!
+def clear_all_responses():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM responses")
+    conn.commit()
+    conn.close()
 
-Формат файла:
-📄 JSON:
-[
-  {{"question": "Как дела?", "answer": "Отлично!"}},
-  {{"question": "Твой любимый цвет?", "answer": "Синий"}}
-]
+def count_responses() -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM responses")
+    c = cur.fetchone()[0]
+    conn.close()
+    return c
 
-📄 TXT:
-Как дела?
+# ====== Index / Matching ======
+class Responder:
+    def __init__(self):
+        self.texts: List[str] = []
+        self.tfidf = None
+        self.vectorizer = None
+        self.use_sklearn = SKLEARN_AVAILABLE
+        logger.info("sklearn available: %s", self.use_sklearn)
+        self.rebuild()
 
-Отлично!
-
-Твой любимый цвет?
-
-Синий
-
-Команды:
-/start - начать
-/help - помощь
-    """
-    
-    keyboard = [
-        [InlineKeyboardButton("📤 Загрузить датасет", callback_data="upload")],
-        [InlineKeyboardButton("⚙️ Режим: Приватный", callback_data="toggle_mode")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-    ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """
-📖 ИНСТРУКЦИЯ
-
-📤 ЗАГРУЗКА ДАТАСЕТА:
-1. Подготовь файл .json или .txt
-2. Отправь его как документ (не как фото!)
-3. Бот обработает и сохранит данные
-
-🔐 РЕЖИМЫ:
-• Приватный (по умолчанию): отвечаю только тебе
-• Публичный: отвечаю всем из твоего датасета
-
-💡 СОВЕТЫ:
-• Используй разные формулировки вопросов
-• Чем больше данных — тем точнее ответы
-• Для лучшего поиска добавляй синонимы
-
-❓ ПРОБЛЕМЫ?
-• Файл не загружается? Убедись, что отправляешь как ДОКУМЕНТ
-• Нет ответа? Проверь, есть ли похожие вопросы в датасете
-    """
-    await update.message.reply_text(help_text)
-
-async def upload_dataset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    
-    if not update.message.document:
-        await update.message.reply_text("Пожалуйста, отправь файл как документ (.json или .txt)")
-        return
-    
-    document = update.message.document
-    
-    # ИСПРАВЛЕНО: filename → file_name
-    file_name = document.file_name.lower() if document.file_name else ""
-    
-    if not file_name.endswith(('.json', '.txt')):
-        await update.message.reply_text("❌ Поддерживаются только .json и .txt файлы!")
-        return
-    
-    await update.message.reply_text("⏳ Обрабатываю файл...")
-    
-    try:
-        file = await context.bot.get_file(document.file_id)
-        user_folder = Path(DATASETS_FOLDER) / str(user.id)
-        user_folder.mkdir(exist_ok=True)
-        
-        # ИСПРАВЛЕНО: используем file_name вместо filename
-        safe_filename = "".join(c if c.isalnum() or c in ('.', '_', '-') else '_' for c in file_name)
-        file_path = user_folder / safe_filename
-        
-        await file.download_to_drive(str(file_path))
-        
-        qa_pairs = RAGEngine.parse_dataset_file(str(file_path))
-        
-        if not qa_pairs:
-            await update.message.reply_text(
-                "❌ Не удалось распарсить файл. Проверь формат:\n"
-                "JSON: [{\"question\": \"...\", \"answer\": \"...\"}]\n"
-                "TXT: Вопрос\\n\\nОтвет"
-            )
-            return
-        
-        db.clear_dataset(user.id)
-        for question, answer, keywords in qa_pairs:
-            db.add_qa_pair(user.id, question, answer, keywords)
-        
-        db.set_dataset_file(user.id, safe_filename)
-        
-        stats = RAGEngine.get_stats(qa_pairs)
-        await update.message.reply_text(
-            f"✅ Датасет загружен!\n{stats}\n\nТеперь можешь задавать вопросы!"
-        )
-    
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
-        logger.error(f"Ошибка загрузки: {e}")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = update.message.text.strip()
-    
-    if text.startswith('/'):
-        return
-    
-    mode = db.get_mode(user.id)
-    
-    if mode == "private":
-        qa_pairs = db.get_all_qa_pairs(user.id)
-        answer = RAGEngine.find_best_answer(text, qa_pairs)
-        
-        if answer:
-            await update.message.reply_text(answer)
+    def rebuild(self):
+        self.texts = get_all_responses()
+        if self.use_sklearn and len(self.texts) > 0:
+            try:
+                self.vectorizer = TfidfVectorizer(max_df=0.85, ngram_range=(1,2)).fit(self.texts)
+                self.tfidf = self.vectorizer.transform(self.texts)
+                logger.info("TF-IDF index built for %d responses", len(self.texts))
+            except Exception as e:
+                logger.exception("Failed building TF-IDF, falling back to fuzzy. Error: %s", e)
+                self.use_sklearn = False
+                self.vectorizer = None
+                self.tfidf = None
         else:
-            await update.message.reply_text(
-                "🤔 Не нашёл ответа в твоём датасете.\n"
-                "Попробуй переформулировать или добавь больше данных."
-            )
-    
-    elif mode == "public":
-        users_with_datasets = db.get_all_users_with_datasets()
-        if not users_with_datasets:
-            await update.message.reply_text("У владельца нет датасета.")
-            return
-        
-        for owner_id in users_with_datasets:
-            qa_pairs = db.get_all_qa_pairs(owner_id)
-            answer = RAGEngine.find_best_answer(text, qa_pairs)
-            if answer:
-                await update.message.reply_text(answer)
-                return
-        
-        await update.message.reply_text("🤔 Не нашёл ответа в датасете.")
+            self.vectorizer = None
+            self.tfidf = None
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    
-    if query.data == "upload":
-        await query.edit_message_text(
-            "📤 ОТПРАВЬ ФАЙЛ\n\n"
-            "Отправь .json или .txt файл как документ.\n"
-            "Формат:\n"
-            "JSON: [{\"question\": \"...\", \"answer\": \"...\"}]\n"
-            "TXT: Вопрос\\n\\nОтвет",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")
-            ]])
-        )
-    
-    elif query.data == "toggle_mode":
-        current = db.get_mode(user_id)
-        new_mode = "public" if current == "private" else "private"
-        db.set_mode(user_id, new_mode)
-        
-        mode_text = "🌐 Публичный" if new_mode == "public" else "🔐 Приватный"
-        await query.edit_message_text(
-            f"✅ Режим изменён на {mode_text}\n\n"
-            f"Теперь бот работает в режиме: {mode_text}",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")
-            ]])
-        )
-    
-    elif query.data == "stats":
-        qa_pairs = db.get_all_qa_pairs(user_id)
-        stats = RAGEngine.get_stats(qa_pairs)
-        await query.edit_message_text(
-            f"📊 СТАТИСТИКА ДАТАСЕТА:\n{stats}",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")
-            ]])
-        )
-    
-    elif query.data == "back_to_main":
-        mode = db.get_mode(user_id)
-        mode_btn = "🌐 Публичный" if mode == "public" else "🔐 Приватный"
-        
-        keyboard = [
-            [InlineKeyboardButton("📤 Загрузить датасет", callback_data="upload")],
-            [InlineKeyboardButton(f"⚙️ Режим: {mode_btn}", callback_data="toggle_mode")],
-            [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("👋 Главное меню", reply_markup=reply_markup)
+    def find_best(self, query: str, top_k: int = TOP_K) -> List[Tuple[str, float]]:
+        if not self.texts:
+            return []
+        if self.use_sklearn and self.tfidf is not None:
+            q_vec = self.vectorizer.transform([query])
+            sims = cosine_similarity(q_vec, self.tfidf).flatten()  # array of similarities
+            idxs = sims.argsort()[::-1][:top_k]
+            return [(self.texts[i], float(sims[i])) for i in idxs]
+        else:
+            # fallback: rapidfuzz extractor
+            choices = {i: t for i,t in enumerate(self.texts)}
+            extracted = process.extract(query, choices, scorer=fuzz.WRatio, limit=top_k)
+            # extracted -> list of (match, score, index)
+            results = []
+            for item in extracted:
+                match_text = item[0]
+                score = item[1] / 100.0  # scale 0..1
+                results.append((match_text, score))
+            return results
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Ошибка: {context.error}")
+responder = Responder()
 
-def main():
-    if not BOT_TOKEN or BOT_TOKEN == "":
-        logger.error("❌ BOT_TOKEN не установлен! Создай файл .env с токеном.")
+# ====== Bot handlers ======
+def is_admin(user_id: int) -> bool:
+    return (user_id in ADMIN_IDS) or (len(ADMIN_IDS) == 0)  # if ADMIN_IDS empty -> allow all (convenience)
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Я бизнес-бот, который отвечает на сообщения по загруженным файлам.\n"
+        "Админ может загрузить файл (.txt/.csv/.json) прямо в этот чат — бот подключит фразы в базу.\n\n"
+        "Команды:\n"
+        "/upload — отправьте документ (файл) в чат\n"
+        "/count — количество загруженных фраз\n"
+        "/clear — очистить базу (только админ)\n"
+        "/help — это сообщение"
+    )
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await start(update, ctx)
+
+async def count_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    c = count_responses()
+    await update.message.reply_text(f"В базе {c} фраз(ы).")
+
+async def clear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("Команда доступна только админам.")
         return
-    
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    application.add_handler(MessageHandler(filters.Document.ALL, upload_dataset))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_error_handler(error_handler)
-    
-    logger.info("✅ Бот запущен и готов к работе!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    clear_all_responses()
+    responder.rebuild()
+    await update.message.reply_text("База очищена.")
+
+async def document_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Accept uploaded document and parse it into lines
+    doc: Document = update.message.document
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("Только админы могут загружать файлы.")
+        return
+
+    file_name = doc.file_name or "uploaded"
+    dst = os.path.join(UPLOADS_DIR, file_name)
+    file = await ctx.bot.get_file(doc.file_id)
+    await file.download_to_drive(dst)
+
+    # parse according to extension
+    lines = []
+    ext = file_name.lower().split(".")[-1]
+    try:
+        if ext in ("txt", "text"):
+            with open(dst, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f.readlines() if l.strip()]
+        elif ext == "csv":
+            import csv
+            with open(dst, newline='', encoding="utf-8") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if row:
+                        lines.append(row[0].strip())
+        elif ext == "json":
+            import json
+            with open(dst, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # expect either list of strings or list of objects with 'text'
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, str):
+                            lines.append(item.strip())
+                        elif isinstance(item, dict) and "text" in item:
+                            lines.append(str(item["text"]).strip())
+                elif isinstance(data, dict):
+                    # maybe {"responses": [...]}
+                    if "responses" in data and isinstance(data["responses"], list):
+                        for it in data["responses"]:
+                            if isinstance(it, str):
+                                lines.append(it.strip())
+        else:
+            # generic: try to read as text
+            with open(dst, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [l.strip() for l in f.readlines() if l.strip()]
+    except Exception as e:
+        logger.exception("Error parsing uploaded file: %s", e)
+        await update.message.reply_text("Не удалось распарсить файл. Убедитесь в корректном формате (.txt/.csv/.json).")
+        return
+
+    if not lines:
+        await update.message.reply_text("Файл загружен, но не найдено ни одной фразы.")
+        return
+
+    add_responses_bulk(lines)
+    responder.rebuild()
+    await update.message.reply_text(f"Загружено {len(lines)} фраз(ы). Всего в базе: {count_responses()}")
+
+async def text_message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text:
+        return
+    # Find best matches
+    matches = responder.find_best(text, top_k=TOP_K)
+    if not matches:
+        await update.message.reply_text("В базе пусто — загрузите файл с фразами (админ).")
+        return
+
+    best_text, score = matches[0]
+    if score >= SIM_THRESHOLD:
+        # respond with best match
+        await update.message.reply_text(best_text)
+    else:
+        # low confidence — show top suggestions and ask for clarification
+        reply = f"Не уверен, но могу предложить варианты (score показан для отладки):\n\n"
+        for t, s in matches:
+            reply += f"- ({s:.2f}) {t}\n"
+        reply += "\nЕсли подходящего ответа нет, загрузите / обновите базу (админ)."
+        await update.message.reply_text(reply)
+
+# ===== main =====
+def main():
+    init_db()
+    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("count", count_cmd))
+    app.add_handler(CommandHandler("clear", clear_cmd))
+
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, document_handler))
+    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, text_message_handler))
+
+    logger.info("Bot starting...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
