@@ -19,8 +19,8 @@ except Exception:
 from rapidfuzz import fuzz, process  # fast fuzzy fallback
 
 # ====== Config ======
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "REPLACE_WITH_YOUR_TOKEN")
-ADMIN_IDS = os.environ.get("ADMIN_IDS", "")  # comma separated user ids who can upload/manage
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8500113818:AAECdcA15J1PBP8uYg4-bOF66RXIrZL161Y")
+ADMIN_IDS = os.environ.get("ADMIN_IDS", "8593061718")  # comma separated user ids who can upload/manage
 ADMIN_IDS = [int(x) for x in ADMIN_IDS.split(",") if x.strip().isdigit()]
 
 DB_PATH = "responses.db"
