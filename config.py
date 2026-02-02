@@ -1,7 +1,6 @@
 import os
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения один раз
 load_dotenv()
 
 # Токен бота от @BotFather
