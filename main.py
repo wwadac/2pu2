@@ -12,7 +12,7 @@ from telegram.ext import (
 )
 
 # ================= НАСТРОЙКИ =================
-BOT_TOKEN = "ВСТАВЬ_СЮДА_ТОКЕН_ОТ_BOTFATHER"
+BOT_TOKEN = "8500113818:AAECdcA15J1PBP8uYg4-bOF66RXIrZL161Y"
 DB_PATH = "responses.db"
 SIM_THRESHOLD = 0.4  # чувствительность (0.3–0.6 норм)
 # =============================================
