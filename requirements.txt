@@ -1,4 +1,3 @@
-aiogram>=3.13.1
+aiogram==3.13.1          # или последняя стабильная на момент написания
 aiosqlite>=0.20.0
-python-dotenv>=1.0.1
-orjson>=3.10.0
+python-dotenv>=1.0.1     # если используешь .env
