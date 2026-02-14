@@ -16,7 +16,7 @@ import aiosqlite
 logging.basicConfig(level=logging.INFO)
 
 # ================== НАСТРОЙКИ ==================
-TOKEN = "8500113818:AAFtNu0DIKfW3otSm845TRH72mpM4d1nfQ8"          # ← Замени
+TOKEN = "8500113818:AAE_8oNOaWmebQXrriNGxxyQVpek_NNHBrM"          # ← Замени
 ADMIN_ID = 8000395560                        # ← Твой Telegram ID
 DB_NAME = "refer_bot.db"
 # ===============================================
